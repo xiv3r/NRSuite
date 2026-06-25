@@ -1,7 +1,4 @@
 #!/bin/python3
-"""
-esp32_wifi_tool.py — Clean Separation (Pure Deauth vs Sniff)
-"""
 
 import os, sys, time, argparse, traceback, subprocess, threading, struct, re
 
@@ -131,10 +128,16 @@ def _setup_bridge(fd=None):
     fd=None  → root backend: open the ESP32 directly via libusb
                               (Nethunter / Termux:Root / sudo, uid 0)
     fd=int   → termux backend: wrap the Android USB fd passed by termux-api
-                                (stock Termux, no-root)
+                              (stock Termux, no-root)
     Returns (device, rx, tx, proto) — same contract regardless of backend.
     """
-    from usb_device import describe_device, get_cdc_endpoints, claim_device, reset_endpoint_toggles
+    from usb_device import (
+        describe_device, 
+        get_cdc_endpoints, 
+        claim_device, 
+        reset_endpoint_toggles, 
+        init_cp2102_bridge
+        )
     from receiver import ReceiverThread
     from sender import Sender
     from protocol import Protocol
@@ -152,7 +155,7 @@ def _setup_bridge(fd=None):
                     if device.is_kernel_driver_active(intf.bInterfaceNumber):
                         device.detach_kernel_driver(intf.bInterfaceNumber)
                 except Exception:
-                    pass
+                   pass
         except Exception:
             pass
     else:
@@ -162,7 +165,11 @@ def _setup_bridge(fd=None):
     log(f"Device: \033[0;92m{describe_device(device)}", C.BLUE)
 
     ep_in, ep_out, intf = get_cdc_endpoints(device)
-    claim_device(device, intf)
+    claim_device(device, intf, fd_wrapped=(fd is not None))
+    
+    # (Safe fallback: native USB devices skip this automatically)
+    init_cp2102_bridge(device)
+    
     reset_endpoint_toggles(device, ep_in, ep_out)
 
     rx = ReceiverThread(device, ep_in, log_func=log)
@@ -178,13 +185,15 @@ def _drain_stale(rx):
         rx.readline(timeout=0.08)
 
 
-def _wait_for_ready(rx):
-    for _ in range(15):
-        line = rx.readline(timeout=0.4)
-        if line and "READY" in line:
+def _wait_for_ready(proto, timeout=10.0):
+    """Poll PING until ESP32 responds, instead of waiting for a one-shot boot string."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        resp = proto.send_cmd("PING", timeout=2)
+        if resp and resp.get("ok"):
             return True
+        time.sleep(0.2)
     return False
-
 
 # ====================== SCAN ======================
 def do_scan(fd: int = None):
@@ -198,16 +207,20 @@ def do_scan(fd: int = None):
 
     proto.on_event = on_event
 
-    _drain_stale(rx)
-    _wait_for_ready(rx)
     proto.start()
+    _drain_stale(rx)
 
-    resp = proto.send_cmd("SCAN_WIFI", timeout=25)
-    
+    _wait_for_ready(proto)
+
+    resp = proto.send_cmd("SCAN_WIFI", timeout=30)
+
     if resp and resp.get("ok"):
         status_str = "OK"
         msg_str = resp.get("msg", "wireless network scan initialized")
         log(f"ESP32-S3: {status_str}, {msg_str}", C.YELLOW)
+    elif resp is None:
+        log("SCAN_WIFI command timed out — no response from ESP32 "
+            "(try unplugging and re-plugging, then run again)", C.RED, level="err")
     else:
         status_str = "FAILED"
         msg_str = resp.get("msg", "internal radio transceiver scanning failure")
@@ -362,9 +375,9 @@ def do_sniff(fd: int = None, args=None):
                 stop_sniff_event.set() # Release the script holding lock
 
     proto.on_pcap = on_pcap
-    _drain_stale(rx)
-    _wait_for_ready(rx)
     proto.start()
+    _drain_stale(rx)
+    _wait_for_ready(proto)
 
     # Optional Deauth trigger sequence optimization
     if getattr(args, 'deauth', False) and args.bssid:
@@ -426,7 +439,7 @@ def do_deauth(fd: int = None, args=None):
     device, rx, tx, proto = _setup_bridge(fd)
 
     _drain_stale(rx)
-    _wait_for_ready(rx)
+    _wait_for_ready(proto)
 
     finished_evt = threading.Event()
 

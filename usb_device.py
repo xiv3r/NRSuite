@@ -321,6 +321,94 @@ def find_usb_device_direct(vid_pid_filter: list[tuple] | None = None):
         "No USB device found on the bus. Is the ESP32 plugged in via OTG?"
     )
 
+def init_uart_bridge(device):
+    """
+    Sends raw vendor control requests to wake up and configure
+    external hardware serial bridges to 115200 baud, 8N1.
+    Includes an explicit hardware reset sequence to pull the ESP32
+    out of bootloader loops/reset traps caused by Android connection probes.
+    """
+    import time
+    vid, pid = device.idVendor, device.idProduct
+
+    # ── CASE 1: Silicon Labs CP2102 ───────────────────────────────────────────
+    if (vid, pid) == (0x10C4, 0xEA60):
+        print("[*] Initializing CP2102 line control registers...", flush=True)
+        try:
+            device.ctrl_transfer(0x41, 0x00, 0x0001, 0, None)       # Enable UART port
+            device.ctrl_transfer(0x40, 0x1E, 0xC200, 0x0001, None)  # Set baud rate to 115200
+            device.ctrl_transfer(0x40, 0x03, 0x0800, 0, None)       # 8N1 line control
+
+            # Hardware reset toggle for CP2102 auto-reset circuit
+            device.ctrl_transfer(0x41, 0x01, 0x0300, 0, None)       # De-assert DTR+RTS
+            time.sleep(0.05)
+            device.ctrl_transfer(0x41, 0x01, 0x0303, 0, None)       # Assert DTR+RTS (normal boot)
+            time.sleep(0.1)
+
+            print("[+] CP2102 successfully configured and reset!", flush=True)
+        except Exception as e:
+            print(f"[-] Warning: CP2102 initialization encountered an error: {e}", flush=True)
+
+    # ── CASE 2: WCH CH340 / CH341 ────────────────────────────────────────────
+    elif (vid, pid) in [(0x1A86, 0x7523), (0x1A86, 0x55D4)]:
+        print("[*] Initializing CH340 register state machine...", flush=True)
+        try:
+            # CH340 line initialization handshake
+            device.ctrl_transfer(0x40, 0xA1, 0, 0, None)
+
+            # Set baud rate to 115200
+            # CH340G uses a single 0x9A write with these divisor values.
+            # The two-write sequence with 0x1312/0xB483 is a CH341A-specific
+            # sequence and produces the wrong baud rate on CH340G.
+            device.ctrl_transfer(0x40, 0x9A, 0xC380, 0xEB00, None)
+
+            # Set line control: 8 data bits, 1 stop bit, no parity (8N1)
+            device.ctrl_transfer(0x40, 0x9A, 0x2518, 0x0050, None)
+
+            # ── HARDWARE RESET TOGGLE FOR ESP32 AUTO-RESET CIRCUIT ────────────
+            # 0xA4 modem control bits are ACTIVE-LOW on CH340.
+            #   0xFF = DTR+RTS de-asserted (idle / lines released)
+            #   0xCF = DTR+RTS asserted   (bits 4+5 pulled low → EN+BOOT driven)
+            #
+            # To get a clean normal-sketch boot (not bootloader):
+            #   1. Assert both  → ESP32 goes into reset
+            #   2. Release both → EN rises, BOOT pin=1 → runs sketch
+            device.ctrl_transfer(0x40, 0xA4, 0xCF, 0, None)  # Assert DTR+RTS → reset
+            time.sleep(0.1)                                    # Hold reset
+            device.ctrl_transfer(0x40, 0xA4, 0xFF, 0, None)  # Release → normal boot
+            time.sleep(0.5)               
+            
+            # Assert DTR so CH340 forwards RX data to host
+            device.ctrl_transfer(0x40, 0xA4, 0xDF, 0, None)  # DTR asserted, RTS released
+            time.sleep(0.05)
+
+            print("[+] CH340 successfully configured and released from reset!", flush=True)
+        except Exception as e:
+            print(f"[-] Warning: CH340 initialization encountered an error: {e}", flush=True)
+
+    # ── CASE 3: FTDI FT232 ───────────────────────────────────────────────────
+    elif (vid, pid) == (0x0403, 0x6001):
+        print("[*] Initializing FTDI FT232 line settings...", flush=True)
+        try:
+            device.ctrl_transfer(0x40, 0x00, 0x0000, 0, None)       # Reset device
+            time.sleep(0.05)
+            device.ctrl_transfer(0x40, 0x03, 0x001A, 0, None)       # Set baud rate to 115200
+            device.ctrl_transfer(0x40, 0x04, 0x0008, 0, None)       # 8N1 line control
+            device.ctrl_transfer(0x40, 0x01, 0x0202, 0, None)       # Assert DTR+RTS
+            time.sleep(0.1)
+
+            print("[+] FTDI FT232 successfully configured!", flush=True)
+        except Exception as e:
+            print(f"[-] Warning: FTDI initialization encountered an error: {e}", flush=True)
+
+    # ── CASE 4: Native USB ESP32-S3 / C3 — no bridge init needed ─────────────
+    else:
+        pass
+
+
+# Backward-compatibility alias — callers using the old name keep working
+init_cp2102_bridge = init_uart_bridge
+
 
 def wrap_direct(vid_pid_filter: list[tuple] | None = None):
     """
@@ -389,45 +477,79 @@ def describe_device(device) -> str:
 
 def get_cdc_endpoints(device):
     """
-    Find bulk IN and OUT endpoints on the CDC Data interface.
+    Find bulk IN and OUT endpoints. 
+    Completely compatible drop-in replacement that works for BOTH:
+      1. Native USB CDC devices (ESP32-S3, ESP32-C3)
+      2. Serial Bridge chips (CP2102, CH340, CH9102, FTDI)
+    
     Returns (ep_in_addr, ep_out_addr, interface_number).
-    Tries all interfaces, picks the first CDC Data (class 0x0A) one.
-    Falls back to any bulk pair if none found.
     """
     import usb.util
+    vid, pid = device.idVendor, device.idProduct
     cfg = device.get_active_configuration()
 
-    for intf in cfg:
-        if intf.bInterfaceClass == 0x0A:
+    if (vid, pid) in [(0x303A, 0x1001), (0x303A, 0x0002)]:
+        # Native ESP32 S3/C3 USB CDC always maps bulk data to Interface 1
+        try:
+            intf = cfg[(1, 0)]
             eps = list(intf)
-            ep_in  = next((e for e in eps
-                           if usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN
-                           and usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK), None)
-            ep_out = next((e for e in eps
+            ep_in = next((e.bEndpointAddress for e in eps if usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN and usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK), None)
+            ep_out = next((e.bEndpointAddress for e in eps if usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT and usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK), None)
+            if ep_in and ep_out:
+                return ep_in, ep_out, 1
+        except Exception:
+            pass
+
+    elif (vid, pid) in [(0x10C4, 0xEA60), (0x1A86, 0x7523), (0x1A86, 0x55D4), (0x0403, 0x6001)]:
+        # Hardware UART Bridges — enumerate from descriptor instead of hardcoding.
+        # Hardcoded 0x81/0x01 fails on fd-wrapped devices because set_configuration()
+        # is skipped (Termux no-root) so _ep_info is never populated.
+        try:
+            intf = cfg[(0, 0)]
+            eps = list(intf)
+            ep_in = next((e.bEndpointAddress for e in eps
+                          if usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN
+                          and usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK), None)
+            ep_out = next((e.bEndpointAddress for e in eps
                            if usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT
                            and usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK), None)
             if ep_in and ep_out:
-                return ep_in.bEndpointAddress, ep_out.bEndpointAddress, intf.bInterfaceNumber
+                return ep_in, ep_out, 0
+        except Exception:
+            pass
+        # Absolute fallback if descriptor walk failed
+        return 0x81, 0x01, 0
 
-    # Fallback: first bulk pair found anywhere
+    # If a new or unknown device is plugged in, look for CDC Data class (0x0A) first
+    for intf in cfg:
+        if intf.bInterfaceClass == 0x0A:
+            eps = list(intf)
+            ep_in = next((e.bEndpointAddress for e in eps if usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN and usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK), None)
+            ep_out = next((e.bEndpointAddress for e in eps if usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT and usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK), None)
+            if ep_in and ep_out:
+                return ep_in, ep_out, intf.bInterfaceNumber
+
+    # Final Fallback: Grab the first valid bulk pair found anywhere on the device
     for intf in cfg:
         eps = list(intf)
-        ep_in  = next((e for e in eps
-                       if usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN
-                       and usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK), None)
-        ep_out = next((e for e in eps
-                       if usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT
-                       and usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK), None)
+        ep_in = next((e.bEndpointAddress for e in eps if usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN and usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK), None)
+        ep_out = next((e.bEndpointAddress for e in eps if usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT and usb.util.endpoint_type(e.bmAttributes) == usb.util.ENDPOINT_TYPE_BULK), None)
         if ep_in and ep_out:
-            return ep_in.bEndpointAddress, ep_out.bEndpointAddress, intf.bInterfaceNumber
+            return ep_in, ep_out, intf.bInterfaceNumber
 
     raise RuntimeError("No bulk endpoint pair found on device")
 
-
-def claim_device(device, interface_num: int):
+def claim_device(device, interface_num: int, fd_wrapped: bool = False):
     """
     Detach kernel driver if needed and claim the interface.
-    Works for both backends - root mode may need to detach cdc_acm.
+
+    fd_wrapped: set True when the device came from wrap_fd() (Termux no-root).
+    In that case we must NOT call set_configuration() — Android has already
+    configured the device and libusb's internal refcount doesn't survive a
+    second configuration attempt on a fd-wrapped handle.  Calling it on the
+    ESP32-S3 (which uses TinyUSB with two CDC interfaces) triggers:
+        assertion "refcnt >= 2" failed
+    and crashes the process.  The root (wrap_direct) path is fine.
     """
     import usb.util
     try:
@@ -435,7 +557,11 @@ def claim_device(device, interface_num: int):
             device.detach_kernel_driver(interface_num)
     except Exception:
         pass
-    device.set_configuration()
+    if not fd_wrapped:
+        try:
+            device.set_configuration()
+        except Exception:
+            pass
     try:
         usb.util.claim_interface(device, interface_num)
     except Exception:

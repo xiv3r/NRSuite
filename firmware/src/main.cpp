@@ -41,7 +41,13 @@ Sniffer        sniffer;
 // WiFi.scanNetworks() internally checks if mode == STA and refuses to run
 // in APSTA on some IDF versions. We call the IDF API directly which has no
 // such restriction.
-static int idf_scan_networks() {
+static volatile bool _scanDone = false;
+
+static void wifiEventHandler(arduino_event_id_t event) {
+    if (event == ARDUINO_EVENT_WIFI_SCAN_DONE) _scanDone = true;
+}
+
+static int idf_scan_networks(BridgeProtocol& proto) {
     wifi_scan_config_t cfg = {};
     cfg.ssid        = nullptr;
     cfg.bssid       = nullptr;
@@ -51,10 +57,21 @@ static int idf_scan_networks() {
     cfg.scan_time.active.min = 100;
     cfg.scan_time.active.max = 300;
 
-    esp_err_t err = esp_wifi_scan_start(&cfg, true);  // true = block until done
-    if (err != ESP_OK) {
-        Serial.printf("[SCAN] esp_wifi_scan_start failed: %d\n", err);
-        return -1;
+    _scanDone = false;
+    WiFi.onEvent(wifiEventHandler);
+
+    esp_err_t err = esp_wifi_scan_start(&cfg, false);  // non-blocking
+    if (err != ESP_OK) return -1;
+
+    uint32_t deadline = millis() + 8000;
+    while (!_scanDone && millis() < deadline) {
+        proto.update();                    // ← keeps UART RX/TX flowing
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    if (!_scanDone) {
+        esp_wifi_scan_stop();
+        return -1;  // timeout
     }
 
     uint16_t count = 0;
@@ -200,7 +217,7 @@ void handleCmd(uint8_t id, JsonDocument& doc) {
         radioIdle();    // stop sniffer + promiscuous, no mode change
 
         // IDF scan — works in APSTA, does not require STA-only mode
-        int n = idf_scan_networks();
+        int n = idf_scan_networks(proto);
         if (n < 0) {
             proto.sendResp(id, false, "scan failed");
             return;
@@ -283,15 +300,8 @@ else if (strcmp(cmd, "DEAUTH") == 0 || strcmp(cmd, "DEAUTH_CAPTURE") == 0) {
         parseMac(bssidStr,  bssid);
         parseMac(clientStr, client);
 
-        // 3. Clear transient sniffer operations completely 
-        sniffer.stop();
-        esp_wifi_set_promiscuous(false);
-        delay(50);
-
-        // 4. Force-cycle the wireless driver subsystem to flush memory ring buffers
-        esp_wifi_stop();
-        
-        WiFi.mode(WIFI_MODE_APSTA);
+        radioIdle();
+        esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
 
         wifi_config_t ap_cfg = {};
         if (esp_wifi_get_config(WIFI_IF_AP, &ap_cfg) == ESP_OK) {
