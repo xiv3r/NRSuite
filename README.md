@@ -5,7 +5,7 @@
 NRSuite bypasses Android's locked-down radio APIs by offloading the radio layer to an ESP32 over USB OTG. Today that means full Wi-Fi monitor mode, packet capture, and frame injection on a stock, unrooted Android phone. The firmware and bridge protocol are built to grow — Bluetooth LE, IR, NRF24, and CC1101 modules are on the roadmap — so the same phone-plus-ESP32 setup becomes a general-purpose wireless toolkit, not a single-purpose tool.
 
 <p align="center">
-  <img src="docs/images/architecture_hw.jpg" width="700" alt="Architecture diagram">
+  <img src="docs/images/architecture_bw.jpg" width="700" alt="Architecture diagram">
 </p>
 
 <p align="center">
