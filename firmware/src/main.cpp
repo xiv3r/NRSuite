@@ -5,6 +5,9 @@
 #include "sniffer.h"
 #include "portal.h"
 #include "mbedtls/base64.h"
+#ifdef ENABLE_BLE_HID
+#include "ble_hid.h"
+#endif
 
 
 // ── Chip name ────────────────────────────────────────────────────────────────
@@ -379,6 +382,74 @@ void handleCmd(uint8_t id, JsonDocument& doc) {
         String json; serializeJson(resp, json);
         proto.sendRaw(TYPE_RESP, id, (const uint8_t*)json.c_str(), json.length());
     }
+    #ifdef ENABLE_BLE_HID
+    else if (strcmp(cmd, "BLE_START") == 0) {
+        const char* name = doc["args"]["name"] | "NRSuite_Keyboard";
+        BleHid::begin(String(name));
+        proto.sendResp(id, true, "ble started");
+    }
+
+    else if (strcmp(cmd, "BLE_STATUS") == 0) {
+        JsonDocument resp;
+        resp["ok"]          = true; 
+        resp["connected"]   = BleHid::isConnected();
+        resp["advertising"] = BleHid::isAdvertising();   // ← NEW
+        resp["peer"]        = BleHid::peerAddress();
+        String json; serializeJson(resp, json);
+        proto.sendRaw(TYPE_RESP, id, (const uint8_t*)json.c_str(), json.length());
+    }
+
+    else if (strcmp(cmd, "BLE_STOP") == 0) {
+        BleHid::end();
+        proto.sendResp(id, true, "ble stopped");
+    }
+
+    else if (strcmp(cmd, "BLE_RUN_SCRIPT") == 0) {
+        const char* script = doc["args"]["script"] | "";
+        if (script[0] == '\0') {
+            proto.sendResp(id, false, "missing script");
+        } else if (!BleHid::isConnected()) {
+            proto.sendResp(id, false, "not paired");
+        } else {
+            int lines = BleHid::runScript(String(script));
+            JsonDocument resp;
+            resp["ok"]    = true;
+            resp["lines"] = lines;
+            String json; serializeJson(resp, json);
+            proto.sendRaw(TYPE_RESP, id, (const uint8_t*)json.c_str(), json.length());
+        }
+    }
+
+    else if (strcmp(cmd, "BLE_STOP_SCRIPT") == 0) {
+        BleHid::stop();
+        proto.sendResp(id, true, "script stopped");
+    }
+
+    else if (strcmp(cmd, "BLE_KEY_DOWN") == 0) {
+        const char* key = doc["args"]["key"] | "";
+        if (key[0] == '\0' || !BleHid::isConnected()) {
+            proto.sendResp(id, false, key[0] == '\0' ? "missing key" : "not paired");
+        } else {
+            BleHid::keyDown(String(key));
+            proto.sendResp(id, true);
+        }
+    }
+
+    else if (strcmp(cmd, "BLE_KEY_UP") == 0) {
+        const char* key = doc["args"]["key"] | "";
+        if (key[0] == '\0' || !BleHid::isConnected()) {
+            proto.sendResp(id, false, key[0] == '\0' ? "missing key" : "not paired");
+        } else {
+            BleHid::keyUp(String(key));
+            proto.sendResp(id, true);
+        }
+    }
+
+    else if (strcmp(cmd, "BLE_RELEASE_ALL") == 0) {
+        BleHid::releaseAll();
+        proto.sendResp(id, true);
+    }
+    #endif
 
     else {
         proto.sendResp(id, false, "unknown command");
