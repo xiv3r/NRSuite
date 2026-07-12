@@ -206,6 +206,7 @@ Sends 15 deauth frames to disconnect clients on the target BSSID. To capture the
 ./nrsuite portal start --ssid "Free WiFi" --file login.html
 
 # Auto-capture EAPOL from a target BSSID while the portal is up
+# This will also send deauth frames on target BSSID
 ./nrsuite portal start --ssid "Free WiFi" --bssid C8:3A:35:CA:75:48
 ```
 
