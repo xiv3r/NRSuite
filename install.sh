@@ -56,15 +56,16 @@ $PIP_CMD install pyusb || {
     echo -e "${RED}[!] Error: Failed to build pyusb constraints.${NC}"
     exit 1
 }
+$PIP_CMD install espbridge
 
-if [ ! -f "nrcap32" ]; then
-    echo -e "${BLUE}[*] Fetching nrcap32 source binaries...${NC}"
-    git clone https://github.com/0xhim4ri-81x/nrcap32.git
-    cd nrcap32 || exit 1
+if [ ! -f "nrsuite" ]; then
+    echo -e "${BLUE}[*] Fetching NRSuite source binaries...${NC}"
+    git clone https://github.com/7wp81x/NRSuite.git
+    cd NRSuite || exit 1
 fi
 
-if [ -f "nrcap32" ]; then
-    chmod +x nrcap32
+if [ -f "nrsuite" ]; then
+    chmod +x nrsuite
 else
     echo -e "${RED}[!] Error: Script infrastructure layout missing.${NC}"
     exit 1
