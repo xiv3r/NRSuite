@@ -36,7 +36,7 @@ def merge_bin_action(source, target, env):
 
     project_dir = env.subst("$PROJECT_DIR")
     release_dir = os.path.join(project_dir, "release")
-    beta_dir = os.path.join(release_dir, "Beta-release")
+    beta_dir = os.path.join(project_dir, "beta-release")
     os.makedirs(release_dir, exist_ok=True)
     os.makedirs(beta_dir, exist_ok=True)
 
