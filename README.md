@@ -57,9 +57,11 @@ This checklist is kept up to date as things land, so it's the single source of t
 
 ---
 
-## Quick Start
+## Quick Start (Termux)
 
-### 1. Install dependencies (Termux)
+Entirely on-device — no PC, no root, no PlatformIO. Just Termux and an OTG cable.
+
+### 1. Install dependencies
 
 ```bash
 pkg update && pkg install python termux-api libusb
@@ -77,14 +79,21 @@ git clone https://github.com/7wp81x/NRSuite
 cd NRSuite
 ```
 
-### 3. Flash the firmware
+### 3. Flash the firmware with nrflash
+
+Pre-built binaries are on the [Releases](https://github.com/7wp81x/nrsuite/releases) page. [`nrflash`](https://github.com/7wp81x/Termux-ESP-Flasher) is a Termux-native, no-root flasher, no pyserial required. it works entirely on-device.
 
 ```bash
-cd firmware/
-pio run -e esp32-c3 --target upload   # or esp32-s3 / esp32-s2 / esp32-devkit
+pip3 install nrflash
+
+# Auto-detects the chip — omit --chip unless you want to force it
+nrflash write --offset 0x0 nrsuite-*
+
+# No stub? Try holding the boot button while plugging in the device
+nrflash write --offset 0x0 nrsuite-* --no-stub
 ```
 
-Confirm it booted correctly — `pio device monitor --baud 115200` should print `ESP32_READY`. See [Firmware](docs/firmware.md) for pre-built binaries and `esptool.py` instructions.
+Confirm it booted correctly — reconnect and run `./nrsuite scan` (below); a working flash will respond as `ESP32_READY`. See [Firmware](docs/firmware.md) for PC-based flashing (`esptool.py`, PlatformIO) if you'd rather build/flash from a laptop instead.
 
 ### 4. Connect and run
 
