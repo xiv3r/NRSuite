@@ -19,6 +19,8 @@ jobs:
       run: |
         mkdir -p downloads
         cd downloads
+        sudo apt update
+        sudo apt install wget -y
         wget https://github.com/7wp81x/NRSuite/releases/download/v1.2.0/nrsuite-esp32-generic.bin
         wget https://github.com/7wp81x/NRSuite/releases/download/v1.2.0/nrsuite-esp32c3.bin
         wget https://github.com/7wp81x/NRSuite/releases/download/v1.2.0/nrsuite-esp32s2.bin
